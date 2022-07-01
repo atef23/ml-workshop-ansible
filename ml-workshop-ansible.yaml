@@ -1,0 +1,231 @@
+---
+- name:               Deploy ml-workshop
+  hosts:              localhost
+  connection:         local
+  gather_facts: no
+
+  vars_prompt:
+    - name:           ocp_username
+      prompt:         "Please provide Openshift Login username"
+      default:        opentlc-mgr
+      private:        no
+    - name:           ocp_password
+      prompt:         "Please provide your Openshift Login password"
+      default:        r3dh4t1!
+      private:        yes
+    - name:           ocp_url
+      prompt:         "Please provide your Openshift URL"
+      default:        https://api.cluster-5c8pp.5c8pp.sandbox891.opentlc.com:6443
+      private:        no
+    - name:           ml_workshop_namespace
+      prompt:         "Please provide a namespace to work in"
+      default:        ml-workshop
+      private:        no
+
+  tasks:
+
+  # Login to Openshift using oc client
+  - name: Login to Openshift
+    ansible.builtin.shell:
+      cmd: oc login {{ocp_url}} --username={{ocp_username}} --password={{ocp_password}} --insecure-skip-tls-verify
+      
+  # Create namespace
+  - name: Create namespace
+    kubernetes.core.k8s:
+      api_version: v1
+      kind: Namespace
+      name: "{{ ml_workshop_namespace }}"
+      state: present
+
+ # Delete limit ranges for the ml-workshop namespace if they exist
+  - name: Delete Limit Ranges
+    k8s:
+      state: absent
+      api_version: v1
+      kind: LimitRange
+      namespace: "{{ ml_workshop_namespace }}"
+      name: "{{ ml_workshop_namespace }}-core-resource-limits"
+
+
+  # Use these tasks for clusters without OperatorHub Preinstalled
+  # - name: Download OLM crds (for clusters without OperatorHub Installed)
+  #   ansible.builtin.get_url:
+  #     url: https://raw.githubusercontent.com/operator-framework/operator-lifecycle-manager/master/deploy/upstream/quickstart/crds.yaml
+  #     dest: ./remote-objects/crds.yaml
+  #     mode: '0775'
+
+  # - name: Download Operator Lifecycle Manager (for clusters without OperatorHub Installed)
+  #   ansible.builtin.get_url:
+  #     url: https://raw.githubusercontent.com/operator-framework/operator-lifecycle-manager/master/deploy/upstream/quickstart/olm.yaml
+  #     dest: ./remote-objects/olm.yaml
+  #     mode: '0775'
+
+  - name: Apply open data hub subscription.
+    kubernetes.core.k8s:
+      state: present
+      src: ./objects/opendatahub-operator-subscription.yaml
+
+  - name: Wait for ODH Operator Installation to complete
+    kubernetes.core.k8s_info:
+      kind: Subscription
+      wait: true
+      label_selectors:
+        - operators.coreos.com/opendatahub-operator.openshift-operators
+      namespace: openshift-operators
+      wait_sleep: 2
+      wait_timeout: 180
+        
+  - name: Download workshop kfdef
+    ansible.builtin.get_url:
+      url: https://raw.githubusercontent.com/odh-labs/ml-workshop/main/src/deploy/kfdef/workshop-kfdef.yaml
+      dest: ./remote-objects/workshop-kfdef.yaml
+      mode: '0775'
+
+  - name: Replace apps uri in kfdef
+    vars:
+      splitlist: "{{ ocp_url | replace('https://api','.apps') | split(':') }}"
+      ocp_apps_uri: "{{ splitlist[0] }}"
+    ansible.builtin.replace:
+      path: ./remote-objects/workshop-kfdef.yaml
+      regexp: '.apps.rosa-5a98.ibhp.p1.openshiftapps.com'
+      replace: "{{ ocp_apps_uri }}"
+
+  - name: Apply the kfdef object
+    kubernetes.core.k8s:
+      namespace: "{{ ml_workshop_namespace }}"
+      state: present
+      src: ./remote-objects/workshop-kfdef.yaml
+
+  - name: Get Machine Sets
+    kubernetes.core.k8s_info:
+      kind: MachineSet
+      namespace: openshift-machine-api
+      api_version: machine.openshift.io/v1beta1
+    register: machineset_list
+
+  # # Throws Error
+  # - name: Patch Machineset InstanceType
+  #   when: machineset_list.resources[0].metadata.name is defined
+  #   kubernetes.core.k8s_json_patch:
+  #     kind: MachineSet
+  #     namespace: openshift-machine-api
+  #     api_version: machine.openshift.io/v1beta1
+  #     api: machine.openshift.io/v1beta1
+  #     name: "{{ machineset_list.resources[0].metadata.name }}"
+  #     patch:
+  #       - op: replace
+  #         patch: /spec/template/spec/providerSpec/value/instanceType
+  #         value: m5.8xlarge
+  
+  - name: Patch Machineset InstanceType
+    when: machineset_list.resources[0].metadata.name is defined
+    ansible.builtin.shell:
+      cmd: >-
+       oc patch MachineSet/{{ machineset_list.resources[0].metadata.name }} -n openshift-machine-api --type=merge --patch-file ./objects/machinesetpatch.yaml
+
+  - name: Download customer data file
+    ansible.builtin.get_url:
+      url: https://raw.githubusercontent.com/odh-labs/ml-workshop/main/data-files/customers/Customer-Churn_P1.csv
+      dest: ./data-objects/Customer-Churn_P1.csv
+      mode: '0775'
+
+  - name: Wait for minio Service to come up
+    kubernetes.core.k8s_info:
+      kind: Pod
+      # wait: true
+      label_selectors:
+        - app.kubernetes.io/name=minio
+      namespace: "{{ ml_workshop_namespace }}"
+      # wait_sleep: 10
+      # wait_timeout: 180
+    register: pod_list
+    until: pod_list|json_query('resources[*].status.phase')|unique == ["Running"]
+    retries: 30
+    delay: 10
+
+  - name: Pause for 30 seconds for minio service to be fully available
+    ansible.builtin.pause:
+      seconds: 30
+
+  - name: Upload file to S3 bucket
+    # Need to make this global
+    vars:
+      splitlist: "{{ ocp_url | replace('https://api','.apps') | split(':') }}"
+      ocp_apps_uri: "{{ splitlist[0] }}"
+    aws_s3:
+      bucket: rawdata
+      object: "Customer-Churn_P1.csv"
+      src: "./data-objects/Customer-Churn_P1.csv"
+      mode: put
+      aws_access_key: minio
+      aws_secret_key: minio123
+      rgw: true
+      encrypt: no
+      s3_url: "http://minio-ml-workshop-{{ ml_workshop_namespace }}{{ ocp_apps_uri }}"
+
+  # - name: Get Superset Access Token
+  #   vars:
+  #     splitlist: "{{ ocp_url | replace('https://api','.apps') | split(':') }}"
+  #     ocp_apps_uri: "{{ splitlist[0] }}"
+  #   ansible.builtin.uri:
+  #     url: "http://superset-{{ ml_workshop_namespace }}{{ ocp_apps_uri }}/api/v1/security/login"
+  #     # user: admin
+  #     # password: admin
+  #     # force_basic_auth: yes
+  #     method: POST
+  #     body: 
+  #       password: admin
+  #       provider: db
+  #       refresh: true
+  #       username: admin
+  #     status_code: 200
+  #     body_format: json
+  #   register: superset_login_response
+
+  # - name: Get Superset CSRF Token
+  #   vars:
+  #     splitlist: "{{ ocp_url | replace('https://api','.apps') | split(':') }}"
+  #     ocp_apps_uri: "{{ splitlist[0] }}"
+  #   ansible.builtin.uri:
+  #     url: "http://superset-{{ ml_workshop_namespace }}{{ ocp_apps_uri }}/api/v1/security/csrf_token"
+  #     # user: admin
+  #     # password: admin
+  #     # force_basic_auth: yes
+  #     method: GET
+  #     headers:
+  #       Authorization: "Bearer {{ superset_login_response.json.access_token }}"
+  #     status_code: 200
+  #     body_format: json
+  #   register: superset_csrf_response
+
+  # - name: debugga
+  #   ansible.builtin.debug:
+  #     msg: "HI its {{ superset_login_response.json.access_token }}"
+
+  # - name: debugga2
+  #   ansible.builtin.debug:
+  #     msg: "YO its {{ superset_csrf_response }}"
+
+  # - name: Test Trino Configuration
+  #   vars:
+  #     splitlist: "{{ ocp_url | replace('https://api','.apps') | split(':') }}"
+  #     ocp_apps_uri: "{{ splitlist[0] }}"
+  #   ansible.builtin.uri:
+  #     url: "http://superset-{{ ml_workshop_namespace }}{{ ocp_apps_uri }}/api/v1/database/test_connection"
+  #     method: POST
+  #     body: 
+  #       sqlalchemy_uri: trino://admin@trino-service:8080
+  #       database_name: Trino
+  #     status_code: 200
+  #     body_format: json
+  #     headers:
+  #       User-Agent: 
+  #       Referer: http://superset-haha.apps.cluster-5c8pp.5c8pp.sandbox891.opentlc.com
+  #       Authorization: "Bearer {{ superset_login_response.json.access_token }}"
+  #       X-CSRFToken: "{{ superset_csrf_response.json.result }}"
+  #       Cookie: 078df8ac3be43da0798bc7402ebb37b7=6c1dbd48d35fb193f0f65184c4d2d2ad; session=.eJwl0N1qhjAMBuB76bGf9i_VeitjSJqmU-a02AobY_e-bt_JCwl5Qsi3WNLFZRVzvW7uxLJFMQtjk5RA2o2Ti-RVGoEYRhk9EyFENdoArJVVSWq2kBS0frQI6IyByfpktFRmDCZYxywjoOSEISJPBLIpz1FLAqedJg5aegZAC9aMk_SiE1SutNTznY92jwzcVoNuc1aBIam1Uxi88YlgjFY5a9gGbG4_CXdupsFOZHzjZd1KPa8vMb-ItdY8D0O5M1-F62PFFXvMufS036Xy9QCacu6fWfCI4fycvOrPzEfdqafzY7hLw_-5HekcxGsn_orn65T4-QU7cmg7.Yr4kPg.O9GJOSgp4HPeboIUup8Tv1hh4xY
+  #   register: response
+
+  # - name: debugga3
+  #   ansible.builtin.debug:
+  #     msg: "YO its {{ response }}"

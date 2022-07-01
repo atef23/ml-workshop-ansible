@@ -1,0 +1,7 @@
+spec:
+  replicas: 3
+  template:
+    spec:
+      providerSpec:
+        value:
+          instanceType: m5.8xlarge

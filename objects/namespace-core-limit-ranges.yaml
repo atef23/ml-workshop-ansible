@@ -1,0 +1,5 @@
+kind: LimitRange
+apiVersion: v1
+metadata:
+  name: "{{ ml_workshop_namespace }}-core-resource-limits"
+  namespace: "{{ ml_workshop_namespace }}"
