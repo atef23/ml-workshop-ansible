@@ -74,6 +74,10 @@
       namespace: openshift-operators
       wait_sleep: 2
       wait_timeout: 180
+
+  - name: Pause for ODH Operator to Propagate to Namespaces
+    ansible.builtin.pause:
+      seconds: 30
         
   - name: Download workshop kfdef
     ansible.builtin.get_url:
